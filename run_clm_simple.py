@@ -20,11 +20,20 @@ from transformers import AutoModelForCausalLM # Used for downloading the weights
 from transformers.optimization import AdamW, get_scheduler
 from transformers import SchedulerType
 
+from PIL import Image
+import numpy as np
+
+def create_image(weights, name, scaling = 5):
+    img = np.clip((weights.cpu().detach().numpy()*scaling + 0.5)*255, 0., 255.).astype(float)
+    img = Image.fromarray(img).convert("L")
+    img.save(name + ".bmp",format="bmp")
+
 set_seed(42) # A convenient function from the transformer library that sets all the seeds
 
 ### CREATING THE DATALOADER ###
 
-source = "insert_source_path_here"
+source = "/home/epd/data/books3/the-eye.eu/public/Books/Bibliotik/H/Harry_Potter_and_the_Deathly_Hallows.epub.txt"
+# source = "/home/epd/smalltext.txt"
 
 def custom_dataset(source):
     return load_dataset('text',data_files={"train":source})
@@ -120,9 +129,20 @@ class Conv1D(nn.Module):
         self.bias = nn.Parameter(torch.zeros(output_dim))
 
     def forward(self, x):
-        size_out = x.size()[:-1] + (self.output_dim,) # USELESS
+        ''' 
+        The last dimension (the embeds) is resized
+        It is important to note that different batches or tokens
+        won't affect each other, only the embeds is resized
+        '''
+        # size_out is (batch_size, context_size, output_dim)
+        size_out = x.size()[:-1] + (self.output_dim,)
+        # self.bias is of shape (output_dim)
+        # x is reshaped to be of size (batch_size*context_size, input_dim)
+        # self.weight is of size (input_dim, output_dim)
         x = torch.addmm(self.bias, x.view(-1, x.size(-1)), self.weight)
-        x = x.view(*size_out) # USELESS
+        # x is of size (batch_size*context_size, output_dim)
+        # Has to be reshaped into (batch_size, context_size, output_dim)
+        x = x.view(*size_out)
         return x
 
 
@@ -155,6 +175,18 @@ class Attention(nn.Module):
         self.register_buffer(
             "bias", torch.tril(torch.ones((n_ctx, n_ctx), dtype=torch.uint8)).view(1, 1, n_ctx, n_ctx)
         )
+        ''' 
+        self.bias
+        tensor([[[[1, 0, 0,  ..., 0, 0, 0],
+                [1, 1, 0,  ..., 0, 0, 0],
+                [1, 1, 1,  ..., 0, 0, 0],
+                ...,
+                [1, 1, 1,  ..., 1, 0, 0],
+                [1, 1, 1,  ..., 1, 1, 0],
+                [1, 1, 1,  ..., 1, 1, 1]]]], dtype=torch.uint8)
+        self.bias.shape
+        torch.Size([1, 1, 1024, 1024])
+        '''
         self.register_buffer("masked_bias", torch.tensor(-1e4)) 
         self.n_head = n_head
         self.split_size = nx
@@ -164,15 +196,35 @@ class Attention(nn.Module):
         self.resid_dropout = nn.Dropout(dropout)
 
     def _attn(self, q, k, v):
+        # q is of shape (batch_size, num_heads, context_size, head_embeds)
+        # k is of shape (batch_size, num_heads, head_embeds, context_size)
+        # By multiplying q and k, we get matrices of size (context_size, context_size),
+        # where each word q_embeds and k_embeds are multiplied to see if
+        # the model should pay attention or not.
+
         w = torch.matmul(q, k)
-        # scaling:
+        # w is of shape (batch_size, num_heads, context_size, context_size)
+        # scaling: weights are divided by the square root of head_embeds
         w = w / (float(v.size(-1)) ** 0.5)
+
+        # Copying self.bias (in this case we could just do
+        # mask = self.bias)
         nd, ns = w.size(-2), w.size(-1)
         mask = self.bias[:, :, ns - nd : ns, :ns]
+        # The mask selects the first word, first two words, etc.
+        
+        # The triangular matrix allows to read words from left to right,
+        # ignoring words to the right.
         w = torch.where(mask.bool(), w, self.masked_bias.to(w.dtype))
         w = nn.Softmax(dim=-1)(w)
         w = self.attn_dropout(w)
 
+        # Finally, we multiply the attention matrix of size (batch_size, num_heads,
+        # context_size, context_size) with the value matrix of size
+        # (batch_size, num_heads, context_size, head_embeds), to get a matrix
+        # of size (batch_size, num_heads, context_size, head_embeds)
+        # Because of the triangular attention matrix, the first row only has info
+        # about the first word, the second row about the first two words, etc.
         return torch.matmul(w, v)
 
     def merge_heads(self, x):
@@ -181,6 +233,12 @@ class Attention(nn.Module):
         return x.view(*new_x_shape)  # in Tensorflow implem: fct merge_states
 
     def split_heads(self, x, is_key = False):
+        # x starts with shape (batch_size, context, embeds)
+        # The shape returned will be (batch_size, num_heads,context, embeds/num_heads)
+        # for query and value, and (batch_size, num_heads, embeds/num_heads, context)
+        # for keys
+        # x is splitted into a number of heads. The context_size stays the same, 
+        # but embeds are split into the different heads
         new_x_shape = x.size()[:-1] + (self.n_head, x.size(-1) // self.n_head)
         x = x.view(*new_x_shape)  # in Tensorflow implem: fct split_states
         if is_key:
@@ -192,16 +250,31 @@ class Attention(nn.Module):
         self,
         hidden_states,
     ):
-        # With a linear layer, make the inputs 3 times larger and split in 3
-        query, key, value = self.c_attn(hidden_states).split(self.split_size, dim=2)
+        # With a linear layer, make the inputs 3 times larger
+        # The dimension goes from (batch_size, context_size, embed size)
+        # to (batch_size, context_size, embed size * 3)
+        # Only the last dimension is modified through the Conv1D layer,
+        # meaning that tokens don't influence each other on that step
+        query_key_value = self.c_attn(hidden_states)
+        # query, key value all have shape (batch_size, context_size, embed size)
+        query, key, value = query_key_value.split(self.split_size, dim=2)
+
         query = self.split_heads(query)      #   Reshaping into
         key = self.split_heads(key, is_key=True)  #   multiple heads
         value = self.split_heads(value)      #
+        # The different head contains different embeds, and are able to pay attention
+        # to different words.
 
+        # the output of _attn is of shape (batch_size, num_heads, context_size, head_embeds)
+        # The embeds for each token now contains information about the tokens that comes
+        # before it, selected by self-attention, but not from tokens that come after 
         output = self._attn(query, key, value)
-
+        # The output is then reshaped to be of size (batch_size, context_size, embeds(768))
         output = self.merge_heads(output)   # Reshaping into a single head
+        # We then go through an additional Conv1D layer. This one doesn't change the size,
+        # of the embeds, and we don't get info from outside of the allowed context.
         output = self.c_proj(output)  # Linear layer that keeps the same shape
+
         output = self.resid_dropout(output)
 
         return output
@@ -219,13 +292,21 @@ class Block(nn.Module):
         self,
         hidden_states,
     ):
+        # The hidden_states goes through a linear norm layer before attention.
+        # https://pytorch.org/docs/stable/generated/torch.nn.LayerNorm.html
+        
+        # The attention output will be of the same size than the hidden state,
+        # but each row now contains information not only about one token, but
+        # also of the tokens that came before (but not after).
         attn_output = self.attn(
             self.ln_1(hidden_states),
         )
-        # residual connection
+        # The attention output is added to the hidden state:
         hidden_states = attn_output + hidden_states
+        
+        # We then go trough a normal multilayer perceptron, which only contains
+        # Conv1D layers, so the context doesn't change.
         feed_forward_hidden_states = self.mlp(self.ln_2(hidden_states))
-        # residual connection
         hidden_states = hidden_states + feed_forward_hidden_states
 
         return hidden_states
@@ -241,9 +322,13 @@ class GPT2Model(nn.Module):
         super().__init__()
 
         self.wte = nn.Embedding(vocab_size, n_embd)
+
         self.wpe = nn.Embedding(n_ctx, n_embd)
+
         self.drop = nn.Dropout(droupout)
+
         self.h = nn.ModuleList([Block(n_ctx) for _ in range(n_layer)])
+
         self.ln_f = nn.LayerNorm(n_embd, eps=1e-05)
 
         self.init_weights()
@@ -274,27 +359,34 @@ class GPT2Model(nn.Module):
         self,
         input_ids,
     ):
+        # Input_ids is a tensor of integers, each of them representing a word.
+        # The tensor is of size (batch_size, context window (1024))
+        batch_size, context_size = input_ids.size() # context_size is usually 1024
 
-        input_shape = input_ids.size()
-        input_ids = input_ids.view(-1, input_shape[-1])
-        batch_size = input_ids.shape[0]
-        
+        # We create position_ids, which is a tensor of shape (1, context_size)
+        # containing integers [0,1,2,3..., context_size] 
+        position_ids = torch.arange(context_size, dtype=torch.long, device=device)
+        position_ids = position_ids.unsqueeze(0).view(-1, context_size)
 
-        position_ids = torch.arange(input_shape[-1], dtype=torch.long, device=device)
-        position_ids = position_ids.unsqueeze(0).view(-1, input_shape[-1])
-
+        # Input_ids go through an embedding layer. (batch_size, context_size) -> (batch_size, context_size, embedding_size (768))
         inputs_embeds = self.wte(input_ids)
+
+        # position ids go through an embedding layer, (1, context_size) -> (1, context_size, embedding_size (768))
+        # the embeddings have been trained to represent position. They'll be the same for
+        # each batch.
         position_embeds = self.wpe(position_ids)
+
+        # hidden_states (batch size, context size, embed size) includes positional info
+        # position_embeds are broadcasted for batch_size
         hidden_states = inputs_embeds + position_embeds
 
         hidden_states = self.drop(hidden_states)
 
-        output_shape = input_shape + (hidden_states.size(-1),)
+        # output_shape (batch_size, context_size, embed_size)
+        output_shape = (batch_size, context_size, hidden_states.size(-1),)
 
         for i, block in enumerate(self.h):
-            outputs = block(hidden_states)
-
-            hidden_states = outputs
+            hidden_states = block(hidden_states)
 
         hidden_states = self.ln_f(hidden_states)
 
@@ -351,9 +443,10 @@ class GPT2LMHeadModel(nn.Module):
         """
 
         hidden_states = self.transformer(input_ids)
-
+        # The lm_head is a linear layer that multiplies the hidden state (batch, ctx, embd)
+        # with weights of size (vocab_size, embd). This doesn't affect context
         lm_logits = self.lm_head(hidden_states)
-
+        # output of size (batch_size, ctx, vocab_size)
         return lm_logits
 
 model = GPT2LMHeadModel()
@@ -433,6 +526,9 @@ for epoch in range(epochs):
         shift_labels = labels[..., 1:].contiguous()
         # Flatten the tokens
         loss = loss_func(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+        if step == 50:
+            print(loss)
+            print("")
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(),max_grad_norm)
         optimizer.step()
