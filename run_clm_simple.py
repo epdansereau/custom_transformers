@@ -20,67 +20,35 @@ from transformers import AutoModelForCausalLM # Used for downloading the weights
 from transformers.optimization import AdamW, get_scheduler
 from transformers import SchedulerType
 
-from PIL import Image
-import numpy as np
+# saving
+import json
+import warnings
+from transformers.trainer_pt_utils import reissue_pt_warnings
 
-def create_image(weights, name, scaling = 5):
-    img = np.clip((weights.cpu().detach().numpy()*scaling + 0.5)*255, 0., 255.).astype(float)
-    img = Image.fromarray(img).convert("L")
-    img.save(name + ".bmp",format="bmp")
-
-set_seed(42) # A convenient function from the transformer library that sets all the seeds
-
-### CREATING THE DATALOADER ###
-
-source = "/home/epd/data/books3/the-eye.eu/public/Books/Bibliotik/H/Harry_Potter_and_the_Deathly_Hallows.epub.txt"
-# source = "/home/epd/smalltext.txt"
+def get_pretrained_tokenizer():
+    return AutoTokenizer.from_pretrained("gpt2")
 
 def custom_dataset(source):
     return load_dataset('text',data_files={"train":source})
 
-
-# We create a dataset that indexes all lines for a text document
-datasets = custom_dataset(source)
-# example
-# dataset['train'][0]
-
-# Using the Tokenizer from hugging face
-tokenizer = AutoTokenizer.from_pretrained("gpt2")
+def prepared_dataset(name, config_name):
+    return load_dataset(name, config_name)
 
 def tokenize_function(examples):
     return tokenizer(examples['text'])
 
-# Tokenizing all the examples
-# The "batched" arguement means that the map function processes by batches (more efficient)
-num_proc = None
-load_from_cache_file = True
-tokenized_datasets = datasets.map(
-    tokenize_function,
-    batched=True,
-    num_proc=num_proc,
-    remove_columns=['text'],
-    load_from_cache_file=load_from_cache_file,
-)
-# The tokenize function does two thing: saves the tokens in 'input_ids',
-# and creates attention mask, which are 1 for every token in this case
-# However, for this specific task, we don't need the attention_mask, since
-# there's no padding
-# example
-# tokenized_datasets['train'][0]['input_ids']
-# tokenized_datasets['train'][0]['attention_mask']
-
 # 1024 tokens in each example
 # We're putting the tokens in two identical
-block_size = 1024
+n_context = 1024
 def group_texts(examples):
     # This function will process 1000 examples at a time
     examples = sum(examples, [])
     total_length = len(examples)
     # We drop the small remainder, we could add padding if the model supported it instead of this drop, you can
     # customize this part to your needs.
-    total_length = (total_length // block_size) * block_size
+    total_length = (total_length // n_context) * n_context
     # Split by chunks of max_len.
-    examples = [examples[i : i + block_size] for i in range(0, total_length, block_size)]
+    examples = [examples[i : i + n_context] for i in range(0, total_length, n_context)]
     result = {
         "input_ids": examples,
         "labels": examples.copy(),
@@ -89,28 +57,46 @@ def group_texts(examples):
 # Note that with `batched=True`, this map processes 1,000 texts together, so group_texts throws away a remainder
 # for each of those groups of 1,000 texts. You can adjust that batch_size here but a higher value might be slower
 # to preprocess.
-#
-# To speed up this part, we use multiprocessing. See the documentation of the map method for more information:
-# https://huggingface.co/docs/datasets/package_reference/main_classes.html#datasets.Dataset.map
-lm_datasets = tokenized_datasets.map(
-    group_texts,
-    batched=True,
-    num_proc=None,
-    load_from_cache_file=False,
-    input_columns = ['input_ids'],
-    remove_columns=['attention_mask'],
 
-)
-# lm_datasets["train"][0]
-# {'attention_mask': [1, 1, 1, 1, 1, 1, 1, 1, 1, ...], 'input_ids': [220, 2, 43638, 18276, 2, 350, 2394, 5781, 4242, ...], 'labels': [220, 2, 43638, 18276, 2, 350, 2394, 5781, 4242, ...]}
+# Tokenizing all the examples
+# The "batched" arguement means that the map function processes by batches (more efficient)
+def get_dataloader(datasets, tokenizer, use_cache):
+    tokenized_datasets = datasets.map(
+        tokenize_function,
+        batched=True,
+        num_proc=None,
+        remove_columns=['text'],
+        load_from_cache_file=use_cache,
+    )
+    # The tokenize function does two thing: saves the tokens in 'input_ids',
+    # and creates attention mask, which are 1 for every token in this case
+    # However, for this specific task, we don't need the attention_mask, since
+    # there's no padding
+    # example
+    # tokenized_datasets['train'][0]['input_ids']
+    # tokenized_datasets['train'][0]['attention_mask']
 
-# Making the dataloader
-# source of data collator: https://github.com/huggingface/transformers/blob/master/src/transformers/data/data_collator.py
+    # To speed up this part, we use multiprocessing. See the documentation of the map method for more information:
+    # https://huggingface.co/docs/datasets/package_reference/main_classes.html#datasets.Dataset.map
+    lm_datasets = tokenized_datasets.map(
+        group_texts,
+        batched=True,
+        num_proc=None,
+        load_from_cache_file=use_cache,
+        input_columns = ['input_ids'],
+        remove_columns=['attention_mask'],
 
-sampler = RandomSampler(lm_datasets['train'])
-collate_fn = default_data_collator
-batch_size = 2
-dataloader = DataLoader(lm_datasets['train'], batch_size = batch_size, collate_fn=collate_fn, sampler = sampler)
+    )
+    # lm_datasets["train"][0]
+    # {'attention_mask': [1, 1, 1, 1, 1, 1, 1, 1, 1, ...], 'input_ids': [220, 2, 43638, 18276, 2, 350, 2394, 5781, 4242, ...], 'labels': [220, 2, 43638, 18276, 2, 350, 2394, 5781, 4242, ...]}
+    # Making the dataloader
+    # source of data collator: https://github.com/huggingface/transformers/blob/master/src/transformers/data/data_collator.py
+
+    sampler = RandomSampler(lm_datasets['train'])
+    collate_fn = default_data_collator
+    dataloader = DataLoader(lm_datasets['train'], batch_size = batch_size, collate_fn=collate_fn, sampler = sampler)
+    
+    return dataloader
 
 class Conv1D(nn.Module):
     """
@@ -154,10 +140,10 @@ function self.act (GELU), casts them back to d_model (768) and adds dropout (0.1
 source: https://amaarora.github.io/2020/02/18/annotatedGPT2.html
 '''
 class MLP(nn.Module):
-    def __init__(self, n_state = 3072, nx = 768, dropout = 0.1):
+    def __init__(self, inner_dim, n_embed, dropout):
         super().__init__()
-        self.c_fc = Conv1D(n_state, nx)
-        self.c_proj = Conv1D(nx, n_state)
+        self.c_fc = Conv1D(inner_dim, n_embed)
+        self.c_proj = Conv1D(n_embed, inner_dim)
         self.act = gelu_new
         self.dropout = nn.Dropout(dropout)
 
@@ -169,11 +155,11 @@ class MLP(nn.Module):
 
 
 class Attention(nn.Module):
-    def __init__(self, nx = 768, n_ctx = 1024, n_head = 12, dropout = 0.1):
+    def __init__(self, n_embed, n_context, n_head, dropout):
         super().__init__()
-        assert nx % n_head == 0
+        assert n_embed % n_head == 0
         self.register_buffer(
-            "bias", torch.tril(torch.ones((n_ctx, n_ctx), dtype=torch.uint8)).view(1, 1, n_ctx, n_ctx)
+            "bias", torch.tril(torch.ones((n_context, n_context), dtype=torch.uint8)).view(1, 1, n_context, n_context)
         )
         ''' 
         self.bias
@@ -189,9 +175,9 @@ class Attention(nn.Module):
         '''
         self.register_buffer("masked_bias", torch.tensor(-1e4)) 
         self.n_head = n_head
-        self.split_size = nx
-        self.c_attn = Conv1D(3 * nx, nx)
-        self.c_proj = Conv1D(nx, nx)
+        self.split_size = n_embed
+        self.c_attn = Conv1D(3 * n_embed, n_embed)
+        self.c_proj = Conv1D(n_embed, n_embed)
         self.attn_dropout = nn.Dropout(dropout)
         self.resid_dropout = nn.Dropout(dropout)
 
@@ -280,13 +266,12 @@ class Attention(nn.Module):
         return output
 
 class Block(nn.Module):
-    def __init__(self, n_ctx = 1024, hidden_size = 768):
+    def __init__(self, n_context, n_embed, n_head, dropout):
         super().__init__()
-        inner_dim = 4 * hidden_size
-        self.ln_1 = nn.LayerNorm(hidden_size, eps=1e-05)
-        self.attn = Attention(hidden_size, n_ctx)
-        self.ln_2 = nn.LayerNorm(hidden_size, eps=1e-05)
-        self.mlp = MLP(inner_dim)
+        self.ln_1 = nn.LayerNorm(n_embed, eps=1e-05)
+        self.attn = Attention(n_embed, n_context, n_head, dropout)
+        self.ln_2 = nn.LayerNorm(n_embed, eps=1e-05)
+        self.mlp = MLP(4 * n_embed, n_embed, dropout)
 
     def forward(
         self,
@@ -314,22 +299,23 @@ class Block(nn.Module):
 
 class GPT2Model(nn.Module):
     def __init__(self,
-                vocab_size = 50257,
-                n_embd = 768,
-                n_ctx = 1024,
-                n_layer = 12,
-                droupout = 0.1):
+                vocab_size,
+                n_embed,
+                n_context,
+                n_layer,
+                n_head,
+                dropout):
         super().__init__()
 
-        self.wte = nn.Embedding(vocab_size, n_embd)
+        self.wte = nn.Embedding(vocab_size, n_embed)
 
-        self.wpe = nn.Embedding(n_ctx, n_embd)
+        self.wpe = nn.Embedding(n_context, n_embed)
 
-        self.drop = nn.Dropout(droupout)
+        self.drop = nn.Dropout(dropout)
 
-        self.h = nn.ModuleList([Block(n_ctx) for _ in range(n_layer)])
+        self.h = nn.ModuleList([Block(n_context, n_embed, n_head, dropout) for _ in range(n_layer)])
 
-        self.ln_f = nn.LayerNorm(n_embd, eps=1e-05)
+        self.ln_f = nn.LayerNorm(n_embed, eps=1e-05)
 
         self.init_weights()
 
@@ -395,16 +381,28 @@ class GPT2Model(nn.Module):
         return hidden_states
 
 class GPT2LMHeadModel(nn.Module):
-
     def __init__(self,
-                vocab_size = 50257,
-                n_embd = 768,
-                n_ctx = 1024,
-                n_layer = 12,
-                droupout = 0.1):
+                vocab_size,
+                n_embed,
+                n_context,
+                n_layer,
+                n_head,
+                dropout):
         super().__init__()
-        self.transformer = GPT2Model(vocab_size, n_embd, n_ctx, n_layer)
-        self.lm_head = nn.Linear(n_embd, vocab_size, bias=False)
+        self.config = {'vocab_size':vocab_size,
+                    'n_embed':n_embed,
+                    'n_context':n_context,
+                    'n_layer':n_layer,
+                    'n_head':n_head,
+                    'dropout':dropout}
+
+        self.transformer = GPT2Model(vocab_size = vocab_size,
+                                    n_embed = n_embed,
+                                    n_context = n_context,
+                                    n_layer = n_layer,
+                                    n_head = n_head,
+                                    dropout = dropout)
+        self.lm_head = nn.Linear(n_embed, vocab_size, bias=False)
 
         self.init_weights()
 
@@ -449,14 +447,8 @@ class GPT2LMHeadModel(nn.Module):
         # output of size (batch_size, ctx, vocab_size)
         return lm_logits
 
-model = GPT2LMHeadModel()
-
-# Downloading the pretrained weights
-# See https://github.com/huggingface/transformers/issues/2422
-home = os.path.expanduser("~")
-cache_path = os.path.join(home, '.cache/transformers_local_model')
-model_name = "gpt2"
 def download_weights(model_name, cache_path):
+    ''' Downloads weights and returns path'''
     model_path = os.path.join(cache_path,model_name)
     weights_path = os.path.join(model_path,"pytorch_model.bin")
     if not(os.path.isdir(model_path) and os.path.isfile(weights_path)):
@@ -466,71 +458,195 @@ def download_weights(model_name, cache_path):
         del _model
     return weights_path
 
-weights_path = download_weights(model_name, cache_path)
+def load_pretrained_model(model_name, model_config, device):
+    model = GPT2LMHeadModel(**model_config)
+    # Downloading the pretrained weights
+    # See https://github.com/huggingface/transformers/issues/2422
+    home = os.path.expanduser("~")
+    cache_path = os.path.join(home, '.cache/transformers_local_model')
+    weights_path = download_weights(model_name, cache_path)
 
-# The state dict can be loaded directly
-weights = torch.load(weights_path)
-model.load_state_dict(weights)
+    # The state dict can be loaded directly
+    weights = torch.load(weights_path)
+    model.load_state_dict(weights)
 
-# Doing training
-epochs = 3
-adam_beta1 = 0.9
-adam_beta2 = 0.999
-adam_epsilon = 1e-08
-learning_rate = 5e-05
-warmup_steps = 0
-lr_scheduler_type = "linear"
-device = "cuda"
-max_grad_norm = 1.0
-seed = 42
+    return model.to(device)
 
-model.to(device)
+def load_untrained_model(model_config, device):
+    model = GPT2LMHeadModel(**model_config)
+    return model.to(device)
 
-# Creating the optimizer and scheduler
-max_steps = len(dataloader)*epochs
-no_decay = ["bias", "LayerNorm.weight"]
-optimizer_grouped_parameters = [
-    {
-        "params": [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)],
-        "weight_decay": 0.0,
-    },
-    {
-        "params": [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)],
-        "weight_decay": 0.0,
-    },
-]
+def load_saved_model(model_path, device):
+    config_path = os.path.join(model_path, 'config.json')
+    with open(config_path, 'r') as f:
+        config = json.load(f)
+    model = GPT2LMHeadModel(**config)
+    weights_path = os.path.join(model_path, 'pytorch_model.bin')
+    weights = torch.load(weights_path)
+    model.load_state_dict(weights)
+    return model.to(device)
 
-optimizer = AdamW(optimizer_grouped_parameters, betas = (adam_beta1, adam_beta2), eps = adam_epsilon, lr = learning_rate)
-lr_scheduler = get_scheduler(
-    name = SchedulerType(lr_scheduler_type),
-    optimizer = optimizer,
-    num_warmup_steps = warmup_steps,
-    num_training_steps = max_steps,
-)
+def load_optimzer_and_scheduler(model,
+                                epochs,
+                                learning_rate,
+                                adam_beta1,
+                                adam_beta2,
+                                adam_epsilon,
+                                lr_scheduler_type,
+                                warmup_steps,
+                                ):
+    # Creating the optimizer and scheduler
+    max_steps = len(dataloader)*epochs
+    no_decay = ["bias", "LayerNorm.weight"]
+    optimizer_grouped_parameters = [
+        {
+            "params": [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)],
+            "weight_decay": 0.0,
+        },
+        {
+            "params": [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)],
+            "weight_decay": 0.0,
+        },
+    ]
 
-### Training loop
+    optimizer = AdamW(optimizer_grouped_parameters, betas = (adam_beta1, adam_beta2), eps = adam_epsilon, lr = learning_rate)
+    lr_scheduler = get_scheduler(
+        name = SchedulerType(lr_scheduler_type),
+        optimizer = optimizer,
+        num_warmup_steps = warmup_steps,
+        num_training_steps = max_steps,
+    )
+    return optimizer, lr_scheduler
 
-model.zero_grad()
-training_loss = 0
-loss_func=CrossEntropyLoss()
-print('done')
-set_seed(seed)
-for epoch in range(epochs):
-    for step, inputs in enumerate(dataloader):
-        model.train()
-        input_ids = inputs['input_ids'].to(device)
-        labels = inputs['labels'].to(device)
-        logits = model(input_ids)
-        # Shift so that tokens < n predict n
-        shift_logits = logits[..., :-1, :].contiguous()
-        shift_labels = labels[..., 1:].contiguous()
-        # Flatten the tokens
-        loss = loss_func(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
-        if step == 50:
-            print(loss)
-            print("")
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(),max_grad_norm)
-        optimizer.step()
-        lr_scheduler.step()
-        model.zero_grad()
+def train(model, optimizer, lr_scheduler, epochs, device, seed, max_grad_norm, output_dir):
+    model.zero_grad()
+    training_loss = 0
+    loss_func=CrossEntropyLoss()
+    if seed is not None:
+       set_seed(seed)
+    steps_per_epoch = len(dataloader)
+    for epoch in range(epochs):
+        for step, inputs in enumerate(dataloader):
+            model.train()
+            input_ids = inputs['input_ids'].to(device)
+            labels = inputs['labels'].to(device)
+            logits = model(input_ids)
+            # Shift so that tokens < n predict n
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+            # Flatten the tokens
+            loss = loss_func(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+            if step == 50:
+                print(loss)
+                breakpoint()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(),max_grad_norm)
+            optimizer.step()
+            lr_scheduler.step()
+            model.zero_grad()
+            if save_each_x_steps and not((steps_per_epoch*epoch + step + 1)%save_each_x_steps):
+                save_model(model, output_dir, epoch, step)
+        if not(save_each_x_steps):
+            save_model(model, output_dir, epoch)
+    if save_each_x_steps:
+        save_model(model, output_dir, epoch, step)
+
+def save_model(model, output_dir, epoch, step = None):
+    os.makedirs(output_dir, exist_ok=True)
+    checkpoint_dir = "ep{}".format(epoch)
+    if step is not  None:
+        checkpoint_dir += "step{}".format(step)
+    checkpoint_dir = os.path.join(output_dir,checkpoint_dir)
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    print("Saving model to", checkpoint_dir)
+    state_dict = model.state_dict()
+    output_model_file = os.path.join(checkpoint_dir, 'pytorch_model.bin')
+    output_config_file = os.path.join(checkpoint_dir, 'config.json')
+    with open(output_config_file, 'w') as f:
+        json.dump(model.config, f)
+    torch.save(state_dict, output_model_file)
+
+if __name__ == "__main__":
+    # Settings
+    use_custom_dataset = False
+    use_prepared_dataset = True
+    # Custom dataset
+    data_path = None
+    # prepared dataset
+    dataset_name = 'wikitext'
+    dataset_config_name = 'wikitext-2-raw-v1'
+    
+    batch_size = 2
+    use_cache = True
+
+    # Model args
+    use_pretrained_model = True
+    use_untrained_model = False
+    use_saved_model = False
+    #Pretrained model
+    model_name = "gpt2"
+    model_type = "gpt2"
+    gpt2_configs = {"distilgpt2":{'n_embed':768, 'n_layer':6,'n_head':12},
+        "gpt2":{'n_embed':768,'n_layer':12,'n_head':12},
+        "gpt2-medium":{'n_embed':1024,'n_layer':24,'n_head':16},
+        "gpt2-large":{'n_embed':1280,'n_layer':36,'n_head':20},
+        "gpt2-xl":{'n_embed':1600,'n_layer':48,'n_head':25} 
+    }
+    model_config = gpt2_configs[model_type]
+    model_config.update({'n_context':1024,'vocab_size':50257,'dropout':0.1})
+    # Saved model
+    saved_model_path = None
+
+
+    # Training settings
+    do_train = True
+    epochs = 3
+    adam_beta1 = 0.9
+    adam_beta2 = 0.999
+    adam_epsilon = 1e-08
+    learning_rate = 5e-05
+    warmup_steps = 0
+    lr_scheduler_type = "linear"
+    device = "cuda"
+    max_grad_norm = 1.0
+    seed = 42
+    output_dir="gpt2_test_output"
+    save_each_x_steps = 200 # Set to 0 to save at the end of each epoch
+
+    if seed is not None:
+        set_seed(seed) # A convenient function from the transformer library that sets all the seeds
+
+    ### CREATING THE DATALOADER ###
+
+    if use_custom_dataset:
+        # We create a dataset that indexes all lines for a text document
+        datasets = custom_dataset(data_path)
+    elif use_prepared_dataset:
+        datasets = prepared_dataset(dataset_name, dataset_config_name)
+
+    # Using the Tokenizer from hugging face
+    tokenizer = get_pretrained_tokenizer()
+
+    dataloader = get_dataloader(datasets, tokenizer, use_cache)
+    if use_pretrained_model:
+        model = load_pretrained_model(model_name, model_config, device)
+    elif use_untrained_model:
+        model = load_untrained_model(model_config, device)
+    elif use_saved_model:
+        model = load_saved_model(saved_model_path, device)
+
+    optimizer, lr_scheduler = load_optimzer_and_scheduler(model,
+                                epochs,
+                                learning_rate,
+                                adam_beta1,
+                                adam_beta2,
+                                adam_epsilon,
+                                lr_scheduler_type,
+                                warmup_steps,
+                                )
+
+    ### Training loop
+    if do_train:
+        train(model, optimizer, lr_scheduler, epochs, device, seed, max_grad_norm, output_dir)
+
+
