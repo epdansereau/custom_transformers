@@ -2,7 +2,7 @@
 from datasets import load_dataset
 from transformers import AutoTokenizer, default_data_collator
 from torch.utils.data import DataLoader
-from torch.utils.data.sampler import RandomSampler
+from torch.utils.data.sampler import RandomSampler, SequentialSampler
 
 # Creating the model
 import torch
@@ -19,17 +19,43 @@ from transformers import AutoModelForCausalLM # Used for downloading the weights
 # Training
 from transformers.optimization import AdamW, get_scheduler
 from transformers import SchedulerType
+from datetime import datetime, timedelta
+import math
 
 # saving
 import json
-import warnings
-from transformers.trainer_pt_utils import reissue_pt_warnings
+
+def log(message, output_dir):
+    ''' Prints and saves string to a file'''
+    os.makedirs(output_dir,exist_ok=True)
+    log_path = os.path.join(output_dir,"log.txt")
+    with open(log_path, 'a') as f:
+        f.write('\n{}'.format(message))
+    print(message)
 
 def get_pretrained_tokenizer():
     return AutoTokenizer.from_pretrained("gpt2")
 
-def custom_dataset(source):
-    return load_dataset('text',data_files={"train":source})
+def custom_dataset(train_path = None, validation_path = None, validation_split_percentage = None):
+    data_files = {}
+    if train_path is not None:
+        data_files['train'] = train_path
+    if validation_path is not None:
+        data_files['validation'] = validation_path
+    datasets = load_dataset('text',data_files=data_files)
+    if validation_split_percentage is not None:
+        datasets["validation"] = load_dataset(
+            'text',
+            data_files=data_files,
+            split="train[:{}%]".format(validation_split_percentage),
+        )
+        datasets["train"] = load_dataset(
+            'text',
+            data_files=data_files,
+            split="train[{}%:]".format(validation_split_percentage),
+        )
+    return datasets
+
 
 def prepared_dataset(name, config_name):
     return load_dataset(name, config_name)
@@ -92,11 +118,20 @@ def get_dataloader(datasets, tokenizer, use_cache):
     # Making the dataloader
     # source of data collator: https://github.com/huggingface/transformers/blob/master/src/transformers/data/data_collator.py
 
-    sampler = RandomSampler(lm_datasets['train'])
     collate_fn = default_data_collator
-    dataloader = DataLoader(lm_datasets['train'], batch_size = batch_size, collate_fn=collate_fn, sampler = sampler)
+    if 'train' in lm_datasets:
+        train_sampler = RandomSampler(lm_datasets['train'])
+        train_dataloader = DataLoader(lm_datasets['train'], batch_size = batch_size, collate_fn=collate_fn, sampler = train_sampler)
+    else:
+        train_dataloader = None
     
-    return dataloader
+    if 'validation' in lm_datasets:
+        eval_sampler = SequentialSampler(lm_datasets['validation'])
+        eval_dataloader = DataLoader(lm_datasets['validation'], batch_size = batch_size, collate_fn=collate_fn, sampler = eval_sampler)
+    else:
+        eval_dataloader = None
+    
+    return train_dataloader, eval_dataloader
 
 class Conv1D(nn.Module):
     """
@@ -487,6 +522,7 @@ def load_saved_model(model_path, device):
     return model.to(device)
 
 def load_optimzer_and_scheduler(model,
+                                dataloader,
                                 epochs,
                                 learning_rate,
                                 adam_beta1,
@@ -518,15 +554,33 @@ def load_optimzer_and_scheduler(model,
     )
     return optimizer, lr_scheduler
 
-def train(model, optimizer, lr_scheduler, epochs, device, seed, max_grad_norm, output_dir):
+def format_time(time):
+    return str(timedelta(seconds = round(time.total_seconds())))
+
+def train(model,
+        train_dataloader,
+        eval_dataloader,
+        optimizer,
+        lr_scheduler,
+        epochs,
+        device,
+        seed,
+        max_grad_norm,
+        output_dir,
+        log_steps,
+        save_each_x_steps):
+    print("Starting training")
+    training_start = datetime.now()
     model.zero_grad()
     training_loss = 0
     loss_func=CrossEntropyLoss()
     if seed is not None:
        set_seed(seed)
-    steps_per_epoch = len(dataloader)
+    steps_per_epoch = len(train_dataloader)
+    time_start = datetime.now()
     for epoch in range(epochs):
-        for step, inputs in enumerate(dataloader):
+        time_start_epoch = datetime.now()
+        for step, inputs in enumerate(train_dataloader):
             model.train()
             input_ids = inputs['input_ids'].to(device)
             labels = inputs['labels'].to(device)
@@ -536,50 +590,102 @@ def train(model, optimizer, lr_scheduler, epochs, device, seed, max_grad_norm, o
             shift_labels = labels[..., 1:].contiguous()
             # Flatten the tokens
             loss = loss_func(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
-            if step == 50:
-                print(loss)
-                breakpoint()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(),max_grad_norm)
             optimizer.step()
             lr_scheduler.step()
             model.zero_grad()
-            if save_each_x_steps and not((steps_per_epoch*epoch + step + 1)%save_each_x_steps):
-                save_model(model, output_dir, epoch, step)
+            training_loss += loss.item()
+            if not (steps_per_epoch*epoch + step + 1)%log_steps:
+                time_new = datetime.now()
+                duration = time_new - time_start
+                epoch_duration = time_new - time_start_epoch
+                estimated_epoch = ((epoch_duration)/(step+1))*steps_per_epoch
+                log_msg = f"Loss {training_loss/log_steps} Epoch {epoch + 1}/{epochs} Step {step+1}/{steps_per_epoch}"
+                log_msg += f" [{format_time(epoch_duration)}<{format_time(estimated_epoch)},  {round(log_steps/duration.total_seconds(),3)}it/s]"
+                time_start = time_new
+                if save_each_x_steps and not((steps_per_epoch*epoch + step + 1)%save_each_x_steps):
+                    val_loss, perplexity  = eval(model,eval_dataloader)
+                    if val_loss is not None:
+                        log_msg += f" Eval_loss {val_loss}"
+                    save_model(model, output_dir, epoch, step, perplexity)
+                log(log_msg,output_dir)
+                training_loss = 0
         if not(save_each_x_steps):
-            save_model(model, output_dir, epoch)
+            log_msg = f"Loss {training_loss/steps_per_epoch} Epoch {epoch + 1} [{format_time(datetime.now() - time_start_epoch)}]"
+            val_loss, perplexity  = eval(model,eval_dataloader)
+            if val_loss is not None:
+                log_msg += f" Eval_loss {val_loss}"
+            save_model(model, output_dir, epoch, step, perplexity)
     if save_each_x_steps:
-        save_model(model, output_dir, epoch, step)
+        val_loss, perplexity  = eval(model,eval_dataloader)
+        save_model(model, output_dir, epoch, step, perplexity)
+    print("Training done in", format_time(datetime.now() - training_start))
 
-def save_model(model, output_dir, epoch, step = None):
+def eval(model, dataloader):
+    if dataloader is None:
+        return None, None
+    print("Starting evaluation")
+    eval_start = datetime.now()
+    model.eval()
+    loss_func=CrossEntropyLoss()
+    eval_loss = 0
+    total_steps = len(dataloader)
+    for inputs in dataloader:
+        input_ids = inputs['input_ids'].to(device)
+        labels = inputs['labels'].to(device)
+        logits = model(input_ids)
+        # Shift so that tokens < n predict n
+        shift_logits = logits[..., :-1, :].contiguous()
+        shift_labels = labels[..., 1:].contiguous()
+        # Flatten the tokens
+        eval_loss += loss_func(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1)).item()
+    eval_loss = eval_loss/total_steps
+    perplexity = round(math.exp(eval_loss),4)
+    print(f"Evaluated {total_steps} batches in {format_time(datetime.now() - eval_start)}")
+    return eval_loss, perplexity
+
+def get_perplexity(loss):
+    return math.exp(loss)
+
+def save_model(model, output_dir, epoch, step = None, perplexity = None):
     os.makedirs(output_dir, exist_ok=True)
     checkpoint_dir = "ep{}".format(epoch)
     if step is not  None:
         checkpoint_dir += "step{}".format(step)
+    if step is not  None:
+        checkpoint_dir += "perp{}".format(perplexity)
     checkpoint_dir = os.path.join(output_dir,checkpoint_dir)
     os.makedirs(checkpoint_dir, exist_ok=True)
-    print("Saving model to", checkpoint_dir)
     state_dict = model.state_dict()
     output_model_file = os.path.join(checkpoint_dir, 'pytorch_model.bin')
     output_config_file = os.path.join(checkpoint_dir, 'config.json')
     with open(output_config_file, 'w') as f:
         json.dump(model.config, f)
     torch.save(state_dict, output_model_file)
+    log_msg = f'Model saved in {output_dir}: Epoch {epoch} Step {step}'
+    if perplexity is not None:
+        log_msg += f' Perpexity {perplexity}'
+    log(log_msg, output_dir)
 
 if __name__ == "__main__":
     # Settings
+    # Dataset
     use_custom_dataset = False
     use_prepared_dataset = True
     # Custom dataset
-    data_path = None
+    train_path = None
+    validation_path = None
+    train_val_split = 10
     # prepared dataset
     dataset_name = 'wikitext'
     dataset_config_name = 'wikitext-2-raw-v1'
     
+    # Dataloader
     batch_size = 2
     use_cache = True
 
-    # Model args
+    # Model 
     use_pretrained_model = True
     use_untrained_model = False
     use_saved_model = False
@@ -595,7 +701,7 @@ if __name__ == "__main__":
     model_config = gpt2_configs[model_type]
     model_config.update({'n_context':1024,'vocab_size':50257,'dropout':0.1})
     # Saved model
-    saved_model_path = None
+    saved_model_path = "gpt2_test_output/ep0step29"
 
 
     # Training settings
@@ -611,7 +717,9 @@ if __name__ == "__main__":
     max_grad_norm = 1.0
     seed = 42
     output_dir="gpt2_test_output"
-    save_each_x_steps = 200 # Set to 0 to save at the end of each epoch
+    log_steps = 50
+    save_each_x_steps = 100 # Set to 0 to save at the end of each epoch (Has to be a multiple of log_steps)
+    assert save_each_x_steps%log_steps == 0
 
     if seed is not None:
         set_seed(seed) # A convenient function from the transformer library that sets all the seeds
@@ -620,14 +728,15 @@ if __name__ == "__main__":
 
     if use_custom_dataset:
         # We create a dataset that indexes all lines for a text document
-        datasets = custom_dataset(data_path)
+        datasets = custom_dataset(train_path, validation_path, train_val_split)
     elif use_prepared_dataset:
         datasets = prepared_dataset(dataset_name, dataset_config_name)
 
     # Using the Tokenizer from hugging face
     tokenizer = get_pretrained_tokenizer()
 
-    dataloader = get_dataloader(datasets, tokenizer, use_cache)
+    train_dataloader, eval_dataloader = get_dataloader(datasets, tokenizer, use_cache)
+
     if use_pretrained_model:
         model = load_pretrained_model(model_name, model_config, device)
     elif use_untrained_model:
@@ -636,6 +745,7 @@ if __name__ == "__main__":
         model = load_saved_model(saved_model_path, device)
 
     optimizer, lr_scheduler = load_optimzer_and_scheduler(model,
+                                train_dataloader,
                                 epochs,
                                 learning_rate,
                                 adam_beta1,
@@ -645,8 +755,22 @@ if __name__ == "__main__":
                                 warmup_steps,
                                 )
 
-    ### Training loop
     if do_train:
-        train(model, optimizer, lr_scheduler, epochs, device, seed, max_grad_norm, output_dir)
+        train(model,
+            train_dataloader,
+            eval_dataloader,
+            optimizer,
+            lr_scheduler,
+            epochs,
+            device,
+            seed,
+            max_grad_norm,
+            output_dir,
+            log_steps,
+            save_each_x_steps)
+    else:
+        eval_loss, perplexity = eval(model, eval_dataloader)
+        print("Eval loss:",eval_loss)
+        print("Perplexity:",perplexity)
 
 
