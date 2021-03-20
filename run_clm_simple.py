@@ -24,6 +24,8 @@ import math
 
 # saving
 import json
+import warnings
+from transformers.trainer_pt_utils import reissue_pt_warnings
 
 def log(message, output_dir):
     ''' Prints and saves string to a file'''
@@ -554,6 +556,21 @@ def load_optimzer_and_scheduler(model,
     )
     return optimizer, lr_scheduler
 
+def save_optimizer_scheduler(optimizer, scheduler, output_dir):
+    torch.save(optimizer.state_dict(), os.path.join(output_dir, "optimizer.pt"))
+    with warnings.catch_warnings(record=True) as caught_warnings:
+        torch.save(scheduler.state_dict(), os.path.join(output_dir, "scheduler.pt"))
+    reissue_pt_warnings(caught_warnings)
+
+def reload_optimizer_scheduler(optimizer, scheduler, output_dir, device):
+    optimizer.load_state_dict(
+        torch.load(os.path.join(output_dir, "optimizer.pt"), map_location=device)
+    )
+    with warnings.catch_warnings(record=True) as caught_warnings:
+        scheduler.load_state_dict(torch.load(os.path.join(output_dir, "scheduler.pt")))
+    reissue_pt_warnings(caught_warnings)
+    return optimizer, scheduler
+
 def format_time(time):
     return str(timedelta(seconds = round(time.total_seconds())))
 
@@ -568,7 +585,11 @@ def train(model,
         max_grad_norm,
         output_dir,
         log_steps,
-        save_each_x_steps):
+        save_each_x_steps,
+        skip_to_epoch,
+        skip_to_step,
+        saved_rng_state,
+        saved_epoch_rng_state):
     print("Starting training")
     training_start = datetime.now()
     model.zero_grad()
@@ -579,8 +600,28 @@ def train(model,
     steps_per_epoch = len(train_dataloader)
     time_start = datetime.now()
     for epoch in range(epochs):
+        if skip_to_epoch is not None:
+            if epoch < skip_to_epoch:
+                continue
+            else:
+                skip_to_epoch = None
+        if saved_epoch_rng_state is not None:
+            torch.set_rng_state(saved_epoch_rng_state[0])
+            torch.cuda.set_rng_state(saved_epoch_rng_state[1])
+            saved_epoch_rng_state = None
+        epoch_rng_state = (torch.get_rng_state(), torch.cuda.get_rng_state())
         time_start_epoch = datetime.now()
         for step, inputs in enumerate(train_dataloader):
+            if skip_to_step is not None:
+                if step < skip_to_step:
+                    continue
+                else:
+                    skip_to_step = None
+                    continue
+            if saved_rng_state is not None:
+                torch.set_rng_state(saved_rng_state[0])
+                torch.cuda.set_rng_state(saved_rng_state[1])
+                saved_rng_state = None
             model.train()
             input_ids = inputs['input_ids'].to(device)
             labels = inputs['labels'].to(device)
@@ -608,7 +649,9 @@ def train(model,
                     val_loss, perplexity  = eval(model,eval_dataloader)
                     if val_loss is not None:
                         log_msg += f" Eval_loss {val_loss}"
-                    save_model(model, output_dir, epoch, step, perplexity)
+                    save_model(model, output_dir, epoch, step, perplexity, optimizer, lr_scheduler, epoch_rng_state)
+                    if epoch == 2:
+                        print('done')
                 log(log_msg,output_dir)
                 training_loss = 0
         if not(save_each_x_steps):
@@ -616,10 +659,10 @@ def train(model,
             val_loss, perplexity  = eval(model,eval_dataloader)
             if val_loss is not None:
                 log_msg += f" Eval_loss {val_loss}"
-            save_model(model, output_dir, epoch, step, perplexity)
+            save_model(model, output_dir, epoch, step, perplexity, optimizer, lr_scheduler, epoch_rng_state)
     if save_each_x_steps:
         val_loss, perplexity  = eval(model,eval_dataloader)
-        save_model(model, output_dir, epoch, step, perplexity)
+        save_model(model, output_dir, epoch, step, perplexity, optimizer, lr_scheduler, epoch_rng_state)
     print("Training done in", format_time(datetime.now() - training_start))
 
 def eval(model, dataloader):
@@ -648,7 +691,7 @@ def eval(model, dataloader):
 def get_perplexity(loss):
     return math.exp(loss)
 
-def save_model(model, output_dir, epoch, step = None, perplexity = None):
+def save_model(model, output_dir, epoch, step = None, perplexity = None, optimizer = None, scheduler = None, epoch_rng_state = None):
     os.makedirs(output_dir, exist_ok=True)
     checkpoint_dir = "ep{}".format(epoch)
     if step is not  None:
@@ -660,13 +703,43 @@ def save_model(model, output_dir, epoch, step = None, perplexity = None):
     state_dict = model.state_dict()
     output_model_file = os.path.join(checkpoint_dir, 'pytorch_model.bin')
     output_config_file = os.path.join(checkpoint_dir, 'config.json')
+    training_state_file = os.path.join(checkpoint_dir, 'training_state.json')
+    torch.save(state_dict, output_model_file)
     with open(output_config_file, 'w') as f:
         json.dump(model.config, f)
-    torch.save(state_dict, output_model_file)
+    training_state = {'epoch':epoch,'step':step}
+    with open(training_state_file, 'w') as f:
+        json.dump(training_state, f)
+    save_optimizer_scheduler(optimizer, scheduler, checkpoint_dir)
+    save_rng_state(checkpoint_dir, epoch_rng_state)
     log_msg = f'Model saved in {output_dir}: Epoch {epoch} Step {step}'
     if perplexity is not None:
         log_msg += f' Perpexity {perplexity}'
     log(log_msg, output_dir)
+
+def save_rng_state(output_dir, epoch_rng_state):
+    rng_state = torch.get_rng_state()
+    rng_cuda_state = torch.cuda.get_rng_state()
+    torch.save(rng_state, os.path.join(output_dir,'rng_state.pt'))
+    torch.save(rng_cuda_state, os.path.join(output_dir,'rng_cuda_state.pt'))
+    torch.save(epoch_rng_state[0], os.path.join(output_dir,'epoch_rng_state.pt'))
+    torch.save(epoch_rng_state[1], os.path.join(output_dir,'epoch_rng_cuda_state.pt'))
+
+def find_resume_step(saved_dir, epochs, steps_per_epoch):
+    with open(os.path.join(saved_dir,'training_state.json')) as f:
+        reloaded_state = json.load(f)
+    skip_to_epoch = reloaded_state['epoch']
+    skip_to_step = reloaded_state['step']
+    if skip_to_epoch == epochs -1 and skip_to_step == steps_per_epoch - 1:
+        raise Exception('Training is already completed. resume_training should be set to False')
+    if skip_to_step == steps_per_epoch - 1:
+        skip_to_step = None
+        skip_to_epoch += 1
+    msg = f'Resuming training from epoch {skip_to_epoch}'
+    if skip_to_step is not None:
+        msg += f', step {skip_to_step}'
+    print(msg)
+    return skip_to_epoch, skip_to_step
 
 if __name__ == "__main__":
     # Settings
@@ -685,41 +758,81 @@ if __name__ == "__main__":
     batch_size = 2
     use_cache = True
 
-    # Model 
-    use_pretrained_model = True
-    use_untrained_model = False
-    use_saved_model = False
-    #Pretrained model
-    model_name = "gpt2"
-    model_type = "gpt2"
-    gpt2_configs = {"distilgpt2":{'n_embed':768, 'n_layer':6,'n_head':12},
-        "gpt2":{'n_embed':768,'n_layer':12,'n_head':12},
-        "gpt2-medium":{'n_embed':1024,'n_layer':24,'n_head':16},
-        "gpt2-large":{'n_embed':1280,'n_layer':36,'n_head':20},
-        "gpt2-xl":{'n_embed':1600,'n_layer':48,'n_head':25} 
-    }
-    model_config = gpt2_configs[model_type]
-    model_config.update({'n_context':1024,'vocab_size':50257,'dropout':0.1})
-    # Saved model
-    saved_model_path = "gpt2_test_output/ep0step29"
+    test_save = False
+    if test_save:
+        # Model 
+        use_pretrained_model = True
+        use_untrained_model = False
+        use_saved_model = False
+        #Pretrained model
+        model_name = "gpt2"
+        model_type = "gpt2"
+        gpt2_configs = {"distilgpt2":{'n_embed':768, 'n_layer':6,'n_head':12},
+            "gpt2":{'n_embed':768,'n_layer':12,'n_head':12},
+            "gpt2-medium":{'n_embed':1024,'n_layer':24,'n_head':16},
+            "gpt2-large":{'n_embed':1280,'n_layer':36,'n_head':20},
+            "gpt2-xl":{'n_embed':1600,'n_layer':48,'n_head':25} 
+        }
+        model_config = gpt2_configs[model_type]
+        model_config.update({'n_context':1024,'vocab_size':50257,'dropout':0.1})
+        # Saved model
+        saved_model_path = None
+        resume_training = True
 
 
-    # Training settings
-    do_train = True
-    epochs = 3
-    adam_beta1 = 0.9
-    adam_beta2 = 0.999
-    adam_epsilon = 1e-08
-    learning_rate = 5e-05
-    warmup_steps = 0
-    lr_scheduler_type = "linear"
-    device = "cuda"
-    max_grad_norm = 1.0
-    seed = 42
-    output_dir="gpt2_test_output"
-    log_steps = 50
-    save_each_x_steps = 100 # Set to 0 to save at the end of each epoch (Has to be a multiple of log_steps)
-    assert save_each_x_steps%log_steps == 0
+        # Training settings
+        do_train = True
+        output_dir="test_save_output"
+        epochs = 3
+        adam_beta1 = 0.9
+        adam_beta2 = 0.999
+        adam_epsilon = 1e-08
+        learning_rate = 5e-05
+        warmup_steps = 0
+        lr_scheduler_type = "linear"
+        device = "cuda"
+        max_grad_norm = 1.0
+        seed = 42
+        log_steps = 50
+        save_each_x_steps = 100 # Set to 0 to save at the end of each epoch (Has to be a multiple of log_steps)
+        assert save_each_x_steps%log_steps == 0
+    else:
+        # Model 
+        use_pretrained_model = False
+        use_untrained_model = False
+        use_saved_model = True
+        #Pretrained model
+        model_name = "gpt2"
+        model_type = "gpt2"
+        gpt2_configs = {"distilgpt2":{'n_embed':768, 'n_layer':6,'n_head':12},
+            "gpt2":{'n_embed':768,'n_layer':12,'n_head':12},
+            "gpt2-medium":{'n_embed':1024,'n_layer':24,'n_head':16},
+            "gpt2-large":{'n_embed':1280,'n_layer':36,'n_head':20},
+            "gpt2-xl":{'n_embed':1600,'n_layer':48,'n_head':25} 
+        }
+        model_config = gpt2_configs[model_type]
+        model_config.update({'n_context':1024,'vocab_size':50257,'dropout':0.1})
+        # Saved model
+        saved_model_path = 'test_save_output/ep1step1040perp20.9532'
+        resume_training = True
+
+
+        # Training settings
+        do_train = True
+        output_dir="gpt2_test_output2"
+        epochs = 3
+        adam_beta1 = 0.9
+        adam_beta2 = 0.999
+        adam_epsilon = 1e-08
+        learning_rate = 5e-05
+        warmup_steps = 0
+        lr_scheduler_type = "linear"
+        device = "cuda"
+        max_grad_norm = 1.0
+        seed = 42
+        log_steps = 50
+        save_each_x_steps = 100 # Set to 0 to save at the end of each epoch (Has to be a multiple of log_steps)
+        assert save_each_x_steps%log_steps == 0
 
     if seed is not None:
         set_seed(seed) # A convenient function from the transformer library that sets all the seeds
@@ -743,7 +856,6 @@ if __name__ == "__main__":
         model = load_untrained_model(model_config, device)
     elif use_saved_model:
         model = load_saved_model(saved_model_path, device)
-
     optimizer, lr_scheduler = load_optimzer_and_scheduler(model,
                                 train_dataloader,
                                 epochs,
@@ -753,7 +865,17 @@ if __name__ == "__main__":
                                 adam_epsilon,
                                 lr_scheduler_type,
                                 warmup_steps,
-                                )
+                            )
+    
+    if use_saved_model and resume_training:
+        optimizer, lr_scheduler = reload_optimizer_scheduler(optimizer, lr_scheduler, saved_model_path, device)
+        skip_to_epoch, skip_to_step = find_resume_step(saved_model_path, epochs, len(train_dataloader))
+        saved_rng_state = (torch.load(os.path.join(saved_model_path,'rng_state.pt')),
+                        torch.load(os.path.join(saved_model_path,'rng_cuda_state.pt')))
+        saved_epoch_rng_state = (torch.load(os.path.join(saved_model_path,'epoch_rng_state.pt')),
+                        torch.load(os.path.join(saved_model_path,'epoch_rng_cuda_state.pt')))
+    else:
+        skip_to_epoch, skip_to_step, saved_rng_state, saved_epoch_rng_state = None, None, None, None
 
     if do_train:
         train(model,
@@ -767,7 +889,11 @@ if __name__ == "__main__":
             max_grad_norm,
             output_dir,
             log_steps,
-            save_each_x_steps)
+            save_each_x_steps,
+            skip_to_epoch,
+            skip_to_step,
+            saved_rng_state,
+            saved_epoch_rng_state)
     else:
         eval_loss, perplexity = eval(model, eval_dataloader)
         print("Eval loss:",eval_loss)
